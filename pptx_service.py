@@ -21,6 +21,7 @@ GET /health  → 200 { "status": "ok" }
 import base64
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -69,6 +70,8 @@ SLIDE_ONE_SHAPES = {
 }
 DEFAULT_MARKER_SHAPES = (52, 55, 56)
 MARK_COLOR = RGBColor(147, 112, 10)
+HEADER_TEXT_COLOR = RGBColor(255, 255, 255)
+_BULLET_PREFIX_RE = re.compile(r"^(?:[\u2022\u2023\u25E6\u2043\u2219\u00b7\-*]+|\d+[.)])\s*")
 
 
 def _project_value(project_data: dict, *keys: str) -> str:
@@ -90,7 +93,22 @@ def _split_items(value) -> list[str]:
             raw_items = text.split("|")
         else:
             raw_items = text.split("\n")
-    return [item.strip(" \t\n•") for item in raw_items if item and item.strip(" \t\n•")]
+    items = []
+    for item in raw_items:
+        cleaned = _clean_item_text(item)
+        if cleaned:
+            items.append(cleaned)
+    return items
+
+
+def _clean_item_text(value) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    while text:
+        cleaned = _BULLET_PREFIX_RE.sub("", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    return text
 
 
 def _is_truthy(value) -> bool:
@@ -149,40 +167,75 @@ def _fit_text_frame(text_frame, max_size: int, vertical_anchor=MSO_ANCHOR.TOP):
         pass
 
 
-def _set_shape_text(shape, text: str, *, max_size: int, bullet: bool = False, vertical_anchor=MSO_ANCHOR.TOP):
+def _set_text_frame_margins(text_frame, *, left=3, right=3, top=2, bottom=2):
+    text_frame.margin_left = Pt(left)
+    text_frame.margin_right = Pt(right)
+    text_frame.margin_top = Pt(top)
+    text_frame.margin_bottom = Pt(bottom)
+
+
+def _estimate_text_lines(shape, items: list[str]) -> int:
+    max_chars = max(12, int(shape.width / 90000))
+    total_lines = 0
+    for item in items:
+        normalized = re.sub(r"\s+", " ", str(item).strip())
+        total_lines += max(1, math.ceil(len(normalized) / max_chars))
+    return max(total_lines, 1)
+
+
+def _responsive_font_size(shape, items: list[str], *, max_size: int, min_size: int, line_factor: float) -> int:
+    available_points = max(12, int(shape.height / 12700) - 4)
+    estimated_lines = _estimate_text_lines(shape, items)
+    adaptive_size = int(available_points / max(1, estimated_lines * line_factor))
+    return max(min_size, min(max_size, adaptive_size))
+
+
+def _set_shape_text(shape, text: str, *, max_size: int, bullet: bool = False, vertical_anchor=MSO_ANCHOR.TOP, min_size: int = 8):
     text_frame = shape.text_frame
     text_frame.clear()
+    _set_text_frame_margins(text_frame)
 
     items = _split_items(text) if bullet else [str(text).strip()]
     if not items:
         items = [""]
 
+    font_size = _responsive_font_size(
+        shape,
+        items,
+        max_size=max_size,
+        min_size=min_size,
+        line_factor=1.15 if bullet else 1.05,
+    )
+
     for index, item in enumerate(items):
         paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
         paragraph.alignment = PP_ALIGN.LEFT
+        paragraph.space_before = Pt(0)
         paragraph.space_after = Pt(0)
+        paragraph.line_spacing = Pt(font_size * (1.02 if bullet else 1.0))
         run = paragraph.add_run()
         run.text = f"• {item}" if bullet and item else item
-        run.font.size = Pt(max_size)
+        run.font.size = Pt(font_size)
 
-    _fit_text_frame(text_frame, max_size=max_size, vertical_anchor=vertical_anchor)
+    _fit_text_frame(text_frame, max_size=font_size, vertical_anchor=vertical_anchor)
 
 
 def _fit_existing_shape(shape, *, max_size: int, vertical_anchor=MSO_ANCHOR.TOP):
     text_frame = shape.text_frame
+    _set_text_frame_margins(text_frame, left=2, right=2, top=1, bottom=1)
     for paragraph in text_frame.paragraphs:
+        paragraph.space_before = Pt(0)
+        paragraph.space_after = Pt(0)
         for run in paragraph.runs:
-            run.font.size = Pt(max_size)
+            current_size = run.font.size.pt if run.font.size else max_size
+            run.font.size = Pt(min(current_size, max_size))
     _fit_text_frame(text_frame, max_size=max_size, vertical_anchor=vertical_anchor)
 
 
 def _set_checkbox_mark(shape, selected: bool):
     text_frame = shape.text_frame
     text_frame.clear()
-    text_frame.margin_left = 0
-    text_frame.margin_right = 0
-    text_frame.margin_top = 0
-    text_frame.margin_bottom = 0
+    _set_text_frame_margins(text_frame, left=0, right=0, top=0, bottom=0)
 
     paragraph = text_frame.paragraphs[0]
     paragraph.alignment = PP_ALIGN.CENTER
@@ -208,10 +261,7 @@ def _add_positioning_mark(slide, label_shape):
     textbox = slide.shapes.add_textbox(mark_left, mark_top, mark_width, mark_height)
     text_frame = textbox.text_frame
     text_frame.clear()
-    text_frame.margin_left = 0
-    text_frame.margin_right = 0
-    text_frame.margin_top = 0
-    text_frame.margin_bottom = 0
+    _set_text_frame_margins(text_frame, left=0, right=0, top=0, bottom=0)
     paragraph = text_frame.paragraphs[0]
     paragraph.alignment = PP_ALIGN.CENTER
     run = paragraph.add_run()
@@ -220,6 +270,62 @@ def _add_positioning_mark(slide, label_shape):
     run.font.size = Pt(16)
     run.font.color.rgb = MARK_COLOR
     _fit_text_frame(text_frame, max_size=16, vertical_anchor=MSO_ANCHOR.MIDDLE)
+
+
+def _resolved_positioning_choice(project_data: dict) -> str:
+    project_positioning = _project_value(project_data, "projectPositioning", "project_positioning").lower()
+    if project_positioning.startswith("exploit"):
+        return "exploit"
+    if project_positioning.startswith("explore"):
+        return "explore"
+
+    exploit_selected = _is_truthy(_project_value(project_data, "exploit_selected", "exploitSelected"))
+    explore_selected = _is_truthy(_project_value(project_data, "explore_selected", "exploreSelected"))
+    if exploit_selected and not explore_selected:
+        return "exploit"
+    if explore_selected and not exploit_selected:
+        return "explore"
+    return ""
+
+
+def _set_header_shape(shape, project_data: dict):
+    rows = [
+        ("N°", _project_value(project_data, "projectNumber")),
+        ("Project Title", _project_value(project_data, "projectTitle")),
+        ("Project Lead", _project_value(project_data, "projectLead")),
+        ("PI UM6P", _project_value(project_data, "piUm6p")),
+    ]
+    text_frame = shape.text_frame
+    text_frame.clear()
+    _set_text_frame_margins(text_frame, left=1, right=1, top=0, bottom=0)
+    font_size = _responsive_font_size(
+        shape,
+        [f"{label}: {value or '-'}" for label, value in rows],
+        max_size=11,
+        min_size=8,
+        line_factor=1.05,
+    )
+
+    for index, (label, value) in enumerate(rows):
+        paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+        paragraph.alignment = PP_ALIGN.LEFT
+        paragraph.space_before = Pt(0)
+        paragraph.space_after = Pt(0)
+        paragraph.line_spacing = Pt(font_size)
+
+        label_run = paragraph.add_run()
+        label_run.text = f"{label} : "
+        label_run.font.bold = True
+        label_run.font.size = Pt(font_size)
+        label_run.font.color.rgb = HEADER_TEXT_COLOR
+
+        value_run = paragraph.add_run()
+        value_run.text = value or "-"
+        value_run.font.bold = True
+        value_run.font.size = Pt(font_size)
+        value_run.font.color.rgb = HEADER_TEXT_COLOR
+
+    _fit_text_frame(text_frame, max_size=font_size, vertical_anchor=MSO_ANCHOR.TOP)
 
 
 def _populate_slide_one(slide, project_data: dict):
@@ -234,78 +340,89 @@ def _populate_slide_one(slide, project_data: dict):
         if index <= len(slide.shapes)
     ]
 
+    _set_header_shape(shapes["header"], project_data)
+
     _set_shape_text(
         shapes["objective"],
         _project_value(project_data, "objective", "projectObjective", "projectDescription"),
-        max_size=17,
+        max_size=15,
         vertical_anchor=MSO_ANCHOR.TOP,
+        min_size=10,
     )
     _set_shape_text(
         shapes["partners"],
         _project_value(project_data, "partners", "partnersCsv"),
-        max_size=15,
+        max_size=12,
         vertical_anchor=MSO_ANCHOR.MIDDLE,
+        min_size=9,
     )
     _set_shape_text(
         shapes["strategic_axis"],
         _project_value(project_data, "strategicAxis"),
-        max_size=15,
+        max_size=13,
         vertical_anchor=MSO_ANCHOR.MIDDLE,
+        min_size=9,
     )
     _set_shape_text(
         shapes["finality"],
         _project_value(project_data, "finality"),
-        max_size=15,
+        max_size=13,
         vertical_anchor=MSO_ANCHOR.MIDDLE,
+        min_size=9,
     )
     _set_shape_text(
         shapes["key_milestones"],
         _project_value(project_data, "key_milestones", "keyMilestonesCsv"),
-        max_size=16,
+        max_size=13,
         bullet=True,
         vertical_anchor=MSO_ANCHOR.TOP,
+        min_size=9,
     )
     _set_shape_text(
         shapes["deliverables"],
         _project_value(project_data, "deliverables", "deliverablesCsv"),
-        max_size=15,
+        max_size=12,
         bullet=True,
         vertical_anchor=MSO_ANCHOR.TOP,
+        min_size=8,
     )
     _set_shape_text(
         shapes["risk_alert"],
         _project_value(project_data, "risks_and_alerts", "risksAndAlertsCsv"),
-        max_size=14,
+        max_size=11,
         bullet=True,
         vertical_anchor=MSO_ANCHOR.TOP,
+        min_size=8,
     )
     _set_shape_text(
         shapes["tasks_done"],
         _project_value(project_data, "done", "doneCsv"),
-        max_size=15,
+        max_size=11,
         bullet=True,
         vertical_anchor=MSO_ANCHOR.TOP,
+        min_size=8,
     )
     _set_shape_text(
         shapes["tasks_in_progress"],
         _project_value(project_data, "in_progress", "inProgressCsv"),
-        max_size=15,
+        max_size=11,
         bullet=True,
         vertical_anchor=MSO_ANCHOR.TOP,
+        min_size=8,
     )
     _set_shape_text(
         shapes["tasks_next_steps"],
         _project_value(project_data, "planned", "plannedCsv"),
-        max_size=15,
+        max_size=11,
         bullet=True,
         vertical_anchor=MSO_ANCHOR.TOP,
+        min_size=8,
     )
 
     for name, size in {
-        "header": 19,
-        "starting_date": 13,
-        "closing_date": 13,
-        "budget_amount": 13,
+        "starting_date": 12,
+        "closing_date": 12,
+        "budget_amount": 12,
         "capex_commitments": 12,
         "capex_expenses": 12,
         "opex_commitments": 12,
@@ -323,12 +440,10 @@ def _populate_slide_one(slide, project_data: dict):
     for marker_shape in default_marker_shapes:
         _remove_shape(marker_shape)
 
-    project_positioning = _project_value(project_data, "projectPositioning").lower()
-    exploit_selected = _is_truthy(_project_value(project_data, "exploit_selected", "exploitSelected")) or project_positioning == "exploit"
-    explore_selected = _is_truthy(_project_value(project_data, "explore_selected", "exploreSelected")) or project_positioning == "explore"
-    if exploit_selected:
+    positioning_choice = _resolved_positioning_choice(project_data)
+    if positioning_choice == "exploit":
         _add_positioning_mark(slide, shapes["exploit_label"])
-    if explore_selected:
+    if positioning_choice == "explore":
         _add_positioning_mark(slide, shapes["explore_label"])
 
 
