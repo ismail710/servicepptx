@@ -41,8 +41,8 @@ Power Apps  →  Launch("data:application/...;base64," & pptxBase64)
 3. Connect your repo
 4. Render auto-detects `render.yaml` and configures everything
 5. Click **Create Web Service**
-6. After ~2 minutes your URL appears: `https://projecthub-pptx-service.onrender.com`
-7. Test it: `GET https://projecthub-pptx-service.onrender.com/health` → `{"status":"ok"}`
+6. Your deployed URL: `https://servicepptx.onrender.com`
+7. Test it: `GET https://servicepptx.onrender.com/api/health` → `{"status":"ok"}`
 
 > **Note:** Free tier spins down after 15 min of inactivity (cold start ~30 s).
 > Upgrade to Starter ($7/month) for always-on.
@@ -129,7 +129,7 @@ Set(
     varPptxResult,
     GeneratePptxForDownload_ProjectHub.Run(
         varPptxPayload,
-        "https://projecthub-pptx-service.onrender.com"   // ← your service URL
+        "https://servicepptx.onrender.com"   // ← live Render service URL
     )
 );
 

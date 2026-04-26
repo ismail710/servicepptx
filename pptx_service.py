@@ -19,7 +19,6 @@ GET /health  → 200 { "status": "ok" }
 """
 
 import base64
-import copy
 import io
 import json
 import os
@@ -28,15 +27,74 @@ import sys
 import traceback
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Pt
-from lxml import etree
 
 # ---------------------------------------------------------------------------
 # Path to the PPTX template (same folder as this script by default)
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", os.path.join(_SCRIPT_DIR, "template1.pptx"))
+FIT_FONT_FAMILY = os.environ.get("PPTX_FONT_FAMILY", "Liberation Sans")
+
+SLIDE_ONE_SHAPES = {
+    "strategic_axis": 5,
+    "closing_date": 6,
+    "starting_date": 8,
+    "objective": 10,
+    "budget_amount": 14,
+    "risk_alert": 16,
+    "finality": 21,
+    "partners": 23,
+    "owner_box": 27,
+    "co_owner_box": 26,
+    "founder_box": 28,
+    "capex_box": 54,
+    "opex_box": 53,
+    "key_milestones": 4,
+    "exploit_label": 33,
+    "explore_label": 39,
+    "capex_commitments": 18,
+    "capex_expenses": 30,
+    "deliverables": 43,
+    "tasks_done": 87,
+    "tasks_in_progress": 89,
+    "tasks_next_steps": 88,
+    "opex_commitments": 48,
+    "opex_expenses": 50,
+    "header": 75,
+}
+DEFAULT_MARKER_SHAPES = (52, 55, 56)
+MARK_COLOR = RGBColor(147, 112, 10)
+
+
+def _project_value(project_data: dict, *keys: str) -> str:
+    for key in keys:
+        value = project_data.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return ""
+
+
+def _split_items(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        text = str(value).replace("\r", "\n")
+        if "|" in text:
+            raw_items = text.split("|")
+        else:
+            raw_items = text.split("\n")
+    return [item.strip(" \t\n•") for item in raw_items if item and item.strip(" \t\n•")]
+
+
+def _is_truthy(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "oui", "x", "checked"}
 
 # ---------------------------------------------------------------------------
 # Placeholder → project field mapping
@@ -49,11 +107,11 @@ PLACEHOLDER_MAP = {
     "{{Starting_Date}}":      lambda p: p.get("startDate", ""),
     "{{Closing_Date}}":       lambda p: p.get("endDate", ""),
     "{{Budget_Amount}}":      lambda p: _fmt_number(p.get("budget", "")),
-    "{{Deliverables_List}}":  lambda p: _bullets(p.get("deliverables", p.get("deliverablesCsv", ""))),
-    "{{Risk_Alert}}":         lambda p: _bullets(p.get("risks_and_alerts", p.get("risksAndAlertsCsv", ""))),
-    "{{Tasks_Done}}":         lambda p: _bullets(p.get("done", p.get("doneCsv", ""))),
-    "{{Tasks_InProgress}}":   lambda p: _bullets(p.get("in_progress", p.get("inProgressCsv", ""))),
-    "{{Tasks_NextSteps}}":    lambda p: _bullets(p.get("planned", p.get("plannedCsv", ""))),
+    "{{Deliverables_List}}":  lambda p: _bullets(_project_value(p, "deliverables", "deliverablesCsv")),
+    "{{Risk_Alert}}":         lambda p: _bullets(_project_value(p, "risks_and_alerts", "risksAndAlertsCsv")),
+    "{{Tasks_Done}}":         lambda p: _bullets(_project_value(p, "done", "doneCsv")),
+    "{{Tasks_InProgress}}":   lambda p: _bullets(_project_value(p, "in_progress", "inProgressCsv")),
+    "{{Tasks_NextSteps}}":    lambda p: _bullets(_project_value(p, "planned", "plannedCsv")),
     "{{CAPEX_Commitments}}":  lambda p: _fmt_number(p.get("capex_commitments", p.get("capexCommitments", ""))),
     "{{CAPEX_Expenses}}":     lambda p: _fmt_number(p.get("capex_expenses", p.get("capexExpenses", ""))),
     "{{OPEX_Commitments}}":   lambda p: _fmt_number(p.get("opex_commitments", p.get("opexCommitments", ""))),
@@ -73,10 +131,205 @@ def _fmt_number(val: str) -> str:
 
 def _bullets(csv_val: str) -> str:
     """Convert pipe-separated CSV to bullet lines: 'A | B' → '• A\n• B'."""
-    if not csv_val:
+    items = _split_items(csv_val)
+    if not items:
         return ""
-    items = [x.strip() for x in str(csv_val).split("|") if x.strip()]
     return "\n".join(f"• {item}" for item in items)
+
+
+def _fit_text_frame(text_frame, max_size: int, vertical_anchor=MSO_ANCHOR.TOP):
+    text_frame.word_wrap = True
+    text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    text_frame.vertical_anchor = vertical_anchor
+    try:
+        text_frame.fit_text(font_family=FIT_FONT_FAMILY, max_size=max_size)
+    except Exception:
+        # Render/other hosts may not have the chosen font installed. Keep
+        # the auto-fit setting so PowerPoint still shrinks text on open.
+        pass
+
+
+def _set_shape_text(shape, text: str, *, max_size: int, bullet: bool = False, vertical_anchor=MSO_ANCHOR.TOP):
+    text_frame = shape.text_frame
+    text_frame.clear()
+
+    items = _split_items(text) if bullet else [str(text).strip()]
+    if not items:
+        items = [""]
+
+    for index, item in enumerate(items):
+        paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+        paragraph.alignment = PP_ALIGN.LEFT
+        paragraph.space_after = Pt(0)
+        run = paragraph.add_run()
+        run.text = f"• {item}" if bullet and item else item
+        run.font.size = Pt(max_size)
+
+    _fit_text_frame(text_frame, max_size=max_size, vertical_anchor=vertical_anchor)
+
+
+def _fit_existing_shape(shape, *, max_size: int, vertical_anchor=MSO_ANCHOR.TOP):
+    text_frame = shape.text_frame
+    for paragraph in text_frame.paragraphs:
+        for run in paragraph.runs:
+            run.font.size = Pt(max_size)
+    _fit_text_frame(text_frame, max_size=max_size, vertical_anchor=vertical_anchor)
+
+
+def _set_checkbox_mark(shape, selected: bool):
+    text_frame = shape.text_frame
+    text_frame.clear()
+    text_frame.margin_left = 0
+    text_frame.margin_right = 0
+    text_frame.margin_top = 0
+    text_frame.margin_bottom = 0
+
+    paragraph = text_frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.CENTER
+    run = paragraph.add_run()
+    run.text = "X" if selected else ""
+    run.font.bold = True
+    run.font.size = Pt(14)
+    run.font.color.rgb = MARK_COLOR
+
+    _fit_text_frame(text_frame, max_size=14, vertical_anchor=MSO_ANCHOR.MIDDLE)
+
+
+def _remove_shape(shape):
+    element = shape.element
+    element.getparent().remove(element)
+
+
+def _add_positioning_mark(slide, label_shape):
+    mark_width = 135157
+    mark_height = 192115
+    mark_left = label_shape.left + (label_shape.width - mark_width) // 2
+    mark_top = label_shape.top + label_shape.height + 23208
+    textbox = slide.shapes.add_textbox(mark_left, mark_top, mark_width, mark_height)
+    text_frame = textbox.text_frame
+    text_frame.clear()
+    text_frame.margin_left = 0
+    text_frame.margin_right = 0
+    text_frame.margin_top = 0
+    text_frame.margin_bottom = 0
+    paragraph = text_frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.CENTER
+    run = paragraph.add_run()
+    run.text = "X"
+    run.font.bold = True
+    run.font.size = Pt(16)
+    run.font.color.rgb = MARK_COLOR
+    _fit_text_frame(text_frame, max_size=16, vertical_anchor=MSO_ANCHOR.MIDDLE)
+
+
+def _populate_slide_one(slide, project_data: dict):
+    shapes = {
+        name: slide.shapes[index - 1]
+        for name, index in SLIDE_ONE_SHAPES.items()
+        if index <= len(slide.shapes)
+    }
+    default_marker_shapes = [
+        slide.shapes[index - 1]
+        for index in DEFAULT_MARKER_SHAPES
+        if index <= len(slide.shapes)
+    ]
+
+    _set_shape_text(
+        shapes["objective"],
+        _project_value(project_data, "objective", "projectObjective", "projectDescription"),
+        max_size=17,
+        vertical_anchor=MSO_ANCHOR.TOP,
+    )
+    _set_shape_text(
+        shapes["partners"],
+        _project_value(project_data, "partners", "partnersCsv"),
+        max_size=15,
+        vertical_anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _set_shape_text(
+        shapes["strategic_axis"],
+        _project_value(project_data, "strategicAxis"),
+        max_size=15,
+        vertical_anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _set_shape_text(
+        shapes["finality"],
+        _project_value(project_data, "finality"),
+        max_size=15,
+        vertical_anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _set_shape_text(
+        shapes["key_milestones"],
+        _project_value(project_data, "key_milestones", "keyMilestonesCsv"),
+        max_size=16,
+        bullet=True,
+        vertical_anchor=MSO_ANCHOR.TOP,
+    )
+    _set_shape_text(
+        shapes["deliverables"],
+        _project_value(project_data, "deliverables", "deliverablesCsv"),
+        max_size=15,
+        bullet=True,
+        vertical_anchor=MSO_ANCHOR.TOP,
+    )
+    _set_shape_text(
+        shapes["risk_alert"],
+        _project_value(project_data, "risks_and_alerts", "risksAndAlertsCsv"),
+        max_size=14,
+        bullet=True,
+        vertical_anchor=MSO_ANCHOR.TOP,
+    )
+    _set_shape_text(
+        shapes["tasks_done"],
+        _project_value(project_data, "done", "doneCsv"),
+        max_size=15,
+        bullet=True,
+        vertical_anchor=MSO_ANCHOR.TOP,
+    )
+    _set_shape_text(
+        shapes["tasks_in_progress"],
+        _project_value(project_data, "in_progress", "inProgressCsv"),
+        max_size=15,
+        bullet=True,
+        vertical_anchor=MSO_ANCHOR.TOP,
+    )
+    _set_shape_text(
+        shapes["tasks_next_steps"],
+        _project_value(project_data, "planned", "plannedCsv"),
+        max_size=15,
+        bullet=True,
+        vertical_anchor=MSO_ANCHOR.TOP,
+    )
+
+    for name, size in {
+        "header": 19,
+        "starting_date": 13,
+        "closing_date": 13,
+        "budget_amount": 13,
+        "capex_commitments": 12,
+        "capex_expenses": 12,
+        "opex_commitments": 12,
+        "opex_expenses": 12,
+    }.items():
+        _fit_existing_shape(shapes[name], max_size=size, vertical_anchor=MSO_ANCHOR.MIDDLE)
+
+    budget_type = _project_value(project_data, "budgetType", "budget_type").lower()
+    _set_checkbox_mark(shapes["capex_box"], budget_type == "capex" or _is_truthy(project_data.get("capexSelected")))
+    _set_checkbox_mark(shapes["opex_box"], budget_type == "opex" or _is_truthy(project_data.get("opexSelected")))
+    _set_checkbox_mark(shapes["owner_box"], _is_truthy(_project_value(project_data, "owner_selected", "ownerSelected")))
+    _set_checkbox_mark(shapes["co_owner_box"], _is_truthy(_project_value(project_data, "co_owner_selected", "coOwnerSelected")))
+    _set_checkbox_mark(shapes["founder_box"], _is_truthy(_project_value(project_data, "founder_selected", "founderSelected")))
+
+    for marker_shape in default_marker_shapes:
+        _remove_shape(marker_shape)
+
+    project_positioning = _project_value(project_data, "projectPositioning").lower()
+    exploit_selected = _is_truthy(_project_value(project_data, "exploit_selected", "exploitSelected")) or project_positioning == "exploit"
+    explore_selected = _is_truthy(_project_value(project_data, "explore_selected", "exploreSelected")) or project_positioning == "explore"
+    if exploit_selected:
+        _add_positioning_mark(slide, shapes["exploit_label"])
+    if explore_selected:
+        _add_positioning_mark(slide, shapes["explore_label"])
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +383,9 @@ def fill_pptx_base64(project_data: dict) -> dict:
                 continue
             for para in shape.text_frame.paragraphs:
                 _replace_in_paragraph(para, replacements)
+
+    if prs.slides:
+        _populate_slide_one(prs.slides[0], project_data)
 
     # Serialize to bytes
     buf = io.BytesIO()
