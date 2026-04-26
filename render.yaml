@@ -1,0 +1,19 @@
+# render.yaml
+# Free deployment on Render.com (https://render.com)
+# Steps:
+#   1. Push this repo to GitHub
+#   2. Go to render.com → New → Web Service → connect your repo
+#   3. Render auto-detects this file and deploys
+#   4. Copy the https://your-service.onrender.com URL into Power Automate
+services:
+  - type: web
+    name: projecthub-pptx-service
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python pptx_service.py"
+    envVars:
+      - key: PORT
+        value: "10000"        # Render assigns this automatically
+      - key: TEMPLATE_PATH
+        value: "template1.pptx"
+    healthCheckPath: /health
