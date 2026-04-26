@@ -397,8 +397,8 @@ def fill_pptx_base64(project_data: dict) -> dict:
                         project_data.get("projectTitle", "Projet"))[:40]
     proj_num   = re.sub(r"[^A-Za-z0-9_-]", "_",
                         project_data.get("projectNumber", "XXX"))
-    date_str   = datetime.now().strftime("%Y%m%d")
-    file_name  = f"{proj_num}_{title_slug}_{date_str}.pptx"
+        run_stamp  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        file_name  = f"{proj_num}_{title_slug}_{run_stamp}.pptx"
 
     return {
         "pptxBase64": base64.b64encode(pptx_bytes).decode("utf-8"),
